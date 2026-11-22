@@ -1,0 +1,35 @@
+import { MongoClient, ObjectId } from 'mongodb';
+import express from "express";
+import cors from "cors";
+import { createRemoteJWKSet, jwtVerify } from "jose";
+import 'dotenv/config'
+
+const app = express();
+const PORT = process.env.PORT || 8000;
+
+app.use(cors());
+app.use(express.json());
+
+
+const client = new MongoClient(process.env.MONGODB_URI);
+export async function connectToMongoDB() {
+  try {
+    await client.connect();
+    console.log("You successfully connected to MongoDB!");
+    return client;
+  } catch (err) {
+    console.dir(err);
+  }
+}
+
+const connectClient = await connectToMongoDB();
+const db = connectClient.db("fixmate");
+const studiocollection = db.collection("##########");
+
+
+
+
+
+app.listen(PORT, ()=> {
+    console.log(`The server is running on port ${PORT}`);
+});
