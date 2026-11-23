@@ -177,6 +177,72 @@ function verifyCustomer(req, res, next) {
   next();
 }
 
+function isImgBbImageUrl(value) {
+  if (typeof value !== "string") return false;
+  try {
+    const imageUrl = new URL(value);
+    return imageUrl.protocol === "https:" && imageUrl.hostname === "i.ibb.co"
+      && !imageUrl.port && !imageUrl.username && !imageUrl.password;
+  } catch {
+    return false;
+  }
+}
+
+app.patch("/api/users/profile", verifyToken, async (req, res) => {
+  try {
+    if (!usersCollection) return sendError(res, 500, "Unable to update your profile right now.");
+
+    const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : {};
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    const nameLength = Array.from(name).length;
+    if (nameLength < 2 || nameLength > 60) {
+      return sendError(res, 400, "Name must be between 2 and 60 characters.");
+    }
+
+    let phone = "";
+    if (body.phone !== undefined && typeof body.phone !== "string") {
+      return sendError(res, 400, "Enter a valid phone number");
+    }
+    if (typeof body.phone === "string" && body.phone.trim()) {
+      phone = body.phone.replace(/[\s-]/g, "");
+      if (!/^\+?\d{7,15}$/.test(phone)) return sendError(res, 400, "Enter a valid phone number");
+    }
+
+    const area = body.area === undefined ? "" : typeof body.area === "string" ? body.area.trim() : null;
+    if (area === null || area.length > 100) return sendError(res, 400, "Area must be 100 characters or fewer.");
+
+    const bio = body.bio === undefined ? "" : typeof body.bio === "string" ? body.bio.trim() : null;
+    if (bio === null || bio.length > 300) return sendError(res, 400, "Bio must be 300 characters or fewer.");
+
+    const updates = { name, phone, area, bio, updatedAt: new Date() };
+    if (Object.prototype.hasOwnProperty.call(body, "image")) {
+      if (!isImgBbImageUrl(body.image)) return sendError(res, 400, "Choose a valid ImgBB profile image.");
+      updates.image = body.image;
+    }
+
+    const result = await usersCollection.updateOne({ email: req.authUser.email }, { $set: updates });
+    if (!result.matchedCount) return sendError(res, 404, "Profile not found.");
+
+    const user = await usersCollection.findOne(
+      { email: req.authUser.email },
+      { projection: { name: 1, email: 1, role: 1, image: 1, phone: 1, area: 1, bio: 1 } },
+    );
+    if (!user) return sendError(res, 404, "Profile not found.");
+
+    return res.json({
+      name: user.name || "",
+      email: user.email,
+      role: user.role || "customer",
+      image: user.image || null,
+      phone: user.phone || "",
+      area: user.area || "",
+      bio: user.bio || "",
+    });
+  } catch {
+    return sendError(res, 500, "Unable to update your profile right now.");
+  }
+});
+
 function publicBooking(booking) {
   const { _id, ...fields } = booking;
   return { id: String(_id), ...fields };
