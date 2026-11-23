@@ -208,28 +208,7 @@ const dashboardBookingStatuses = ["requested", "accepted", "in-progress", "compl
 app.get("/api/technician/dashboard/overview", verifyToken, verifyTechnician, async (req, res) => {
   try {
     if (!servicesCollection || !bookingsCollection) {
-      return sendError(res, 500, "Unable to load the technician dashboard right now.");
-    }
-
-    const technicianEmail = req.authUser.email;
-    const [serviceSummaryRows, bookingSummaryRows, recentRequests] = await Promise.all([
-      servicesCollection.aggregate([
-        { $match: { technicianEmail } },
-        {
-          $group: {
-            _id: null,
-            total: { $sum: 1 },
-            approved: { $sum: { $cond: [{ $eq: ["$approvalStatus", "approved"] }, 1, 0] } },
-            pendingApproval: { $sum: { $cond: [{ $eq: ["$approvalStatus", "pending"] }, 1, 0] } },
-            unavailable: { $sum: { $cond: [{ $eq: ["$isAvailable", false] }, 1, 0] } },
-          },
-        },
-        { $project: { _id: 0, total: 1, approved: 1, pendingApproval: 1, unavailable: 1 } },
-      ]).toArray(),
-      bookingsCollection.aggregate([
-        { $match: { technicianEmail } },
-        {
-          $group: {
+     
             _id: null,
             total: { $sum: 1 },
             requested: { $sum: { $cond: [{ $eq: ["$status", "requested"] }, 1, 0] } },
