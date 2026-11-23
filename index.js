@@ -44,6 +44,7 @@ if (connectClient) {
       servicesCollection.createIndex({ approvalStatus: 1, isAvailable: 1, createdAt: -1 }),
       servicesCollection.createIndex({ approvalStatus: 1, isAvailable: 1, basePrice: 1 }),
       bookingsCollection.createIndex({ customerEmail: 1, createdAt: -1 }),
+      bookingsCollection.createIndex({ customerEmail: 1, status: 1 }),
       paymentsCollection.createIndex({ customerEmail: 1, paidAt: -1 }),
       paymentsCollection.createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true }),
     ]);
@@ -193,9 +194,67 @@ app.get("/api/bookings/my", verifyToken, verifyCustomer, async (req, res) => {
   if (!bookingMatch(req, res)) return;
   try {
     const filter = { customerEmail: req.authUser.email };
-    if (typeof req.query.status === "string" && bookingStatuses.includes(req.query.status)) filter.status = req.query.status;
-    const bookings = await bookingsCollection.find(filter).sort({ createdAt: -1, _id: -1 }).toArray();
-    return res.json({ bookings: bookings.map(publicBooking) });
+    const listStatuses = ["requested", "accepted", "in-progress", "completed"];
+    if (typeof req.query.status === "string" && listStatuses.includes(req.query.status)) filter.status = req.query.status;
+
+    const [bookings, [summaryResult]] = await Promise.all([
+      bookingsCollection.find(filter)
+        .project({ _id: 1, serviceId: 1, serviceTitle: 1, serviceImage: 1, category: 1, technicianName: 1, preferredDate: 1, basePrice: 1, finalAmount: 1, status: 1, paymentStatus: 1, createdAt: 1 })
+        .sort({ createdAt: -1, _id: -1 })
+        .toArray(),
+      bookingsCollection.aggregate([
+        { $match: { customerEmail: req.authUser.email } },
+        { $facet: {
+          counts: [{ $group: {
+            _id: null,
+            all: { $sum: 1 },
+            requested: { $sum: { $cond: [{ $eq: ["$status", "requested"] }, 1, 0] } },
+            accepted: { $sum: { $cond: [{ $eq: ["$status", "accepted"] }, 1, 0] } },
+            "in-progress": { $sum: { $cond: [{ $eq: ["$status", "in-progress"] }, 1, 0] } },
+            completed: { $sum: { $cond: [{ $eq: ["$status", "completed"] }, 1, 0] } },
+            rejected: { $sum: { $cond: [{ $eq: ["$status", "rejected"] }, 1, 0] } },
+            cancelled: { $sum: { $cond: [{ $eq: ["$status", "cancelled"] }, 1, 0] } },
+          } },
+          { $project: { _id: 0, all: 1, requested: 1, accepted: 1, "in-progress": 1, completed: 1, rejected: 1, cancelled: 1 } },
+        ],
+          pendingLatest: [
+            { $match: { status: "requested" } },
+            { $sort: { createdAt: -1, _id: -1 } },
+            { $limit: 1 },
+            { $project: { _id: 0, latestTitle: { $ifNull: ["$serviceTitle", "$title"] } } },
+          ],
+          inProgressLatest: [
+            { $match: { status: "in-progress" } },
+            { $sort: { createdAt: -1, _id: -1 } },
+            { $limit: 1 },
+            { $project: { _id: 0, latestTitle: { $ifNull: ["$serviceTitle", "$title"] } } },
+          ],
+          paymentDue: [
+            { $match: { status: "completed", paymentStatus: "unpaid" } },
+            { $group: { _id: null, count: { $sum: 1 }, totalAmount: { $sum: "$finalAmount" } } },
+            { $project: { _id: 0, count: 1, totalAmount: 1 } },
+          ],
+          paymentDueLatest: [
+            { $match: { status: "completed", paymentStatus: "unpaid" } },
+            { $sort: { createdAt: -1, _id: -1 } },
+            { $limit: 1 },
+            { $project: { _id: 0, latestTitle: { $ifNull: ["$serviceTitle", "$title"] } } },
+          ],
+        } },
+      ]).toArray(),
+    ]);
+
+    const counts = summaryResult?.counts?.[0] || { all: 0, requested: 0, accepted: 0, "in-progress": 0, completed: 0, rejected: 0, cancelled: 0 };
+    const due = summaryResult?.paymentDue?.[0] || { count: 0, totalAmount: 0 };
+    return res.json({
+      bookings: bookings.map((booking) => ({ ...booking, _id: String(booking._id), ...(booking.serviceId ? { serviceId: String(booking.serviceId) } : {}) })),
+      counts,
+      highlights: {
+        pendingRequests: { count: counts.requested, latestTitle: summaryResult?.pendingLatest?.[0]?.latestTitle || null },
+        inProgress: { count: counts["in-progress"], latestTitle: summaryResult?.inProgressLatest?.[0]?.latestTitle || null },
+        paymentDue: { count: due.count || 0, totalAmount: due.totalAmount || 0, latestTitle: summaryResult?.paymentDueLatest?.[0]?.latestTitle || null },
+      },
+    });
   } catch {
     return sendError(res, 500, "Unable to load bookings right now.");
   }
@@ -204,52 +263,28 @@ app.get("/api/bookings/my", verifyToken, verifyCustomer, async (req, res) => {
 app.get("/api/bookings/my/summary", verifyToken, verifyCustomer, async (req, res) => {
   if (!bookingMatch(req, res)) return;
   try {
-    const now = new Date();
-    const firstMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 5, 1));
-    const months = Array.from({ length: 6 }, (_, index) => {
-      const date = new Date(Date.UTC(firstMonth.getUTCFullYear(), firstMonth.getUTCMonth() + index, 1));
-      return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`;
-    });
-    const [result] = await bookingsCollection.aggregate([
+    const groupedStatuses = await bookingsCollection.aggregate([
       { $match: { customerEmail: req.authUser.email } },
-      { $facet: {
-        counts: [{ $group: {
-          _id: null,
-          total: { $sum: 1 },
-          requested: { $sum: { $cond: [{ $eq: ["$status", "requested"] }, 1, 0] } },
-          accepted: { $sum: { $cond: [{ $eq: ["$status", "accepted"] }, 1, 0] } },
-          inProgress: { $sum: { $cond: [{ $eq: ["$status", "in-progress"] }, 1, 0] } },
-          completed: { $sum: { $cond: [{ $eq: ["$status", "completed"] }, 1, 0] } },
-          rejected: { $sum: { $cond: [{ $eq: ["$status", "rejected"] }, 1, 0] } },
-          cancelled: { $sum: { $cond: [{ $eq: ["$status", "cancelled"] }, 1, 0] } },
-        } }],
-        monthly: [
-          { $match: { createdAt: { $gte: firstMonth } } },
-          { $group: { _id: { $dateToString: { format: "%Y-%m", date: "$createdAt" } }, count: { $sum: 1 } } },
-        ],
-        readyToPay: [
-          { $match: { status: "completed", paymentStatus: "unpaid" } },
-          { $sort: { createdAt: -1, _id: -1 } },
-          { $limit: 1 },
-        ],
-      } },
+      { $group: { _id: "$status", count: { $sum: 1 } } },
     ]).toArray();
-    const counts = result?.counts?.[0] || {};
-    const monthlyMap = new Map((result?.monthly || []).map((item) => [item._id, item.count]));
+    const byStatus = {
+      requested: 0,
+      accepted: 0,
+      "in-progress": 0,
+      completed: 0,
+      rejected: 0,
+      cancelled: 0,
+    };
+    for (const entry of groupedStatuses) {
+      if (Object.hasOwn(byStatus, entry._id)) byStatus[entry._id] = entry.count;
+    }
+    const total = groupedStatuses.reduce((sum, entry) => sum + entry.count, 0);
+    const active = byStatus.requested + byStatus.accepted + byStatus["in-progress"];
     return res.json({
-      total: counts.total || 0,
-      active: (counts.requested || 0) + (counts.accepted || 0) + (counts.inProgress || 0),
-      completed: counts.completed || 0,
-      byStatus: {
-        requested: counts.requested || 0,
-        accepted: counts.accepted || 0,
-        "in-progress": counts.inProgress || 0,
-        completed: counts.completed || 0,
-        rejected: counts.rejected || 0,
-        cancelled: counts.cancelled || 0,
-      },
-      perMonth: months.map((month) => ({ month, count: monthlyMap.get(month) || 0 })),
-      readyToPay: result?.readyToPay?.[0] ? publicBooking(result.readyToPay[0]) : null,
+      total,
+      active,
+      completed: byStatus.completed,
+      byStatus,
     });
   } catch {
     return sendError(res, 500, "Unable to load booking summary right now.");
@@ -262,7 +297,7 @@ app.patch("/api/bookings/:id/cancel", verifyToken, verifyCustomer, async (req, r
   try {
     const result = await bookingsCollection.updateOne(
       { _id: new ObjectId(req.params.id), customerEmail: req.authUser.email, status: "requested" },
-      { $set: { status: "cancelled", updatedAt: new Date() } },
+      { $set: { status: "cancelled" } },
     );
     if (!result.matchedCount) {
       const booking = await bookingsCollection.findOne({ _id: new ObjectId(req.params.id) });
@@ -278,25 +313,45 @@ app.patch("/api/bookings/:id/cancel", verifyToken, verifyCustomer, async (req, r
 app.get("/api/payments/my", verifyToken, verifyCustomer, async (req, res) => {
   if (!paymentsCollection) return sendError(res, 500, "Unable to load payments right now.");
   try {
-    const [payments, totals] = await Promise.all([
-      paymentsCollection.find({ customerEmail: req.authUser.email }).sort({ paidAt: -1, _id: -1 }).toArray(),
-      paymentsCollection.aggregate([
-        { $match: { customerEmail: req.authUser.email } },
-        { $group: { _id: null, totalPaid: { $sum: "$amount" }, count: { $sum: 1 } } },
-      ]).toArray(),
-    ]);
+    const [result] = await paymentsCollection.aggregate([
+      { $match: { customerEmail: req.authUser.email } },
+      { $facet: {
+        payments: [
+          { $sort: { paidAt: -1, _id: -1 } },
+          { $project: { serviceTitle: 1, technicianName: 1, amount: 1, transactionId: 1, paidAt: 1 } },
+        ],
+        summary: [
+          { $group: {
+            _id: null,
+            totalPaid: { $sum: "$amount" },
+            count: { $sum: 1 },
+            lastPaymentDate: { $max: "$paidAt" },
+          } },
+          { $project: { _id: 0, totalPaid: 1, count: 1, lastPaymentDate: 1 } },
+        ],
+        latest: [
+          { $sort: { paidAt: -1, _id: -1 } },
+          { $limit: 1 },
+          { $project: { _id: 0, serviceTitle: 1, amount: 1 } },
+        ],
+      } },
+    ]).toArray();
+    const totals = result?.summary?.[0] || { totalPaid: 0, count: 0, lastPaymentDate: null };
     return res.json({
-      payments: payments.map((payment) => ({
+      payments: (result?.payments || []).map((payment) => ({
         id: String(payment._id),
-        bookingId: payment.bookingId,
         amount: payment.amount,
         transactionId: payment.transactionId,
         paidAt: payment.paidAt,
         serviceTitle: payment.serviceTitle,
         technicianName: payment.technicianName,
       })),
-      totalPaid: totals[0]?.totalPaid || 0,
-      count: totals[0]?.count || 0,
+      summary: {
+        totalPaid: totals.totalPaid || 0,
+        count: totals.count || 0,
+        lastPaymentDate: totals.lastPaymentDate || null,
+        latest: result?.latest?.[0] || null,
+      },
     });
   } catch {
     return sendError(res, 500, "Unable to load payments right now.");
