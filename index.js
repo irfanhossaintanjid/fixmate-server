@@ -43,8 +43,10 @@ if (connectClient) {
     await Promise.all([
       servicesCollection.createIndex({ approvalStatus: 1, isAvailable: 1, createdAt: -1 }),
       servicesCollection.createIndex({ approvalStatus: 1, isAvailable: 1, basePrice: 1 }),
+      servicesCollection.createIndex({ technicianEmail: 1, createdAt: -1 }),
       bookingsCollection.createIndex({ customerEmail: 1, createdAt: -1 }),
       bookingsCollection.createIndex({ customerEmail: 1, status: 1 }),
+      bookingsCollection.createIndex({ technicianEmail: 1, status: 1, createdAt: -1 }),
       paymentsCollection.createIndex({ customerEmail: 1, paidAt: -1 }),
       paymentsCollection.createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true }),
     ]);
@@ -124,6 +126,25 @@ app.get(["/services", "/api/services"], async (req, res) => {
   }
 });
 
+app.get("/api/services/technician", verifyToken, verifyTechnician, async (req, res) => {
+  try {
+    if (!servicesCollection) return sendError(res, 500, "Unable to load your services right now.");
+    const services = await servicesCollection.find(
+      { technicianEmail: req.authUser.email },
+      {
+        projection: {
+          _id: 1, title: 1, category: 1, description: 1, image: 1,
+          basePrice: 1, estimatedDuration: 1, serviceMode: 1, serviceArea: 1,
+          approvalStatus: 1, isAvailable: 1, createdAt: 1, rejectionReason: 1,
+        },
+      },
+    ).sort({ createdAt: -1, _id: -1 }).toArray();
+    return res.json({ services: services.map((service) => ({ ...service, id: service._id.toString(), _id: undefined })) });
+  } catch {
+    return sendError(res, 500, "Unable to load your services right now.");
+  }
+});
+
 app.get(["/services/:id", "/api/services/:id"], async (req, res) => {
   try {
     const { id } = req.params;
@@ -177,6 +198,79 @@ function verifyCustomer(req, res, next) {
   next();
 }
 
+function verifyTechnician(req, res, next) {
+  if (req.authUser?.role !== "technician") return sendError(res, 403, "Forbidden");
+  next();
+}
+
+const dashboardBookingStatuses = ["requested", "accepted", "in-progress", "completed", "rejected", "cancelled"];
+
+app.get("/api/technician/dashboard/overview", verifyToken, verifyTechnician, async (req, res) => {
+  try {
+    if (!servicesCollection || !bookingsCollection) {
+      return sendError(res, 500, "Unable to load the technician dashboard right now.");
+    }
+
+    const technicianEmail = req.authUser.email;
+    const [serviceSummaryRows, bookingSummaryRows, recentRequests] = await Promise.all([
+      servicesCollection.aggregate([
+        { $match: { technicianEmail } },
+        {
+          $group: {
+            _id: null,
+            total: { $sum: 1 },
+            approved: { $sum: { $cond: [{ $eq: ["$approvalStatus", "approved"] }, 1, 0] } },
+            pendingApproval: { $sum: { $cond: [{ $eq: ["$approvalStatus", "pending"] }, 1, 0] } },
+            unavailable: { $sum: { $cond: [{ $eq: ["$isAvailable", false] }, 1, 0] } },
+          },
+        },
+        { $project: { _id: 0, total: 1, approved: 1, pendingApproval: 1, unavailable: 1 } },
+      ]).toArray(),
+      bookingsCollection.aggregate([
+        { $match: { technicianEmail } },
+        {
+          $group: {
+            _id: null,
+            total: { $sum: 1 },
+            requested: { $sum: { $cond: [{ $eq: ["$status", "requested"] }, 1, 0] } },
+            accepted: { $sum: { $cond: [{ $eq: ["$status", "accepted"] }, 1, 0] } },
+            inProgress: { $sum: { $cond: [{ $eq: ["$status", "in-progress"] }, 1, 0] } },
+            completed: { $sum: { $cond: [{ $eq: ["$status", "completed"] }, 1, 0] } },
+            rejected: { $sum: { $cond: [{ $eq: ["$status", "rejected"] }, 1, 0] } },
+            cancelled: { $sum: { $cond: [{ $eq: ["$status", "cancelled"] }, 1, 0] } },
+          },
+        },
+        { $project: { _id: 0, total: 1, requested: 1, accepted: 1, inProgress: 1, completed: 1, rejected: 1, cancelled: 1 } },
+      ]).toArray(),
+      bookingsCollection.find(
+        { technicianEmail },
+        {
+          projection: {
+            _id: 1, serviceTitle: 1, serviceImage: 1, category: 1,
+            customerName: 1, customerPhone: 1, preferredDate: 1,
+            createdAt: 1, status: 1, paymentStatus: 1,
+          },
+        },
+      ).sort({ createdAt: -1, _id: -1 }).limit(5).toArray(),
+    ]);
+
+    const serviceSummary = serviceSummaryRows[0] || { total: 0, approved: 0, pendingApproval: 0, unavailable: 0 };
+    const bookingSummary = bookingSummaryRows[0] || { total: 0, requested: 0, accepted: 0, inProgress: 0, completed: 0, rejected: 0, cancelled: 0 };
+    const byStatus = Object.fromEntries(dashboardBookingStatuses.map((status) => [
+      status,
+      status === "in-progress" ? bookingSummary.inProgress : bookingSummary[status] || 0,
+    ]));
+
+    return res.json({
+      services: serviceSummary,
+      bookings: { total: bookingSummary.total, byStatus },
+      recentRequests: recentRequests.map((booking) => ({ ...booking, _id: booking._id.toString() })),
+    });
+  } catch {
+    return sendError(res, 500, "Unable to load the technician dashboard right now.");
+  }
+});
+
 function isImgBbImageUrl(value) {
   if (typeof value !== "string") return false;
   try {
@@ -187,6 +281,110 @@ function isImgBbImageUrl(value) {
     return false;
   }
 }
+
+app.post("/api/services", verifyToken, verifyTechnician, express.json(), async (req, res) => {
+  try {
+    if (!servicesCollection) return sendError(res, 500, "Unable to submit this service right now.");
+
+    const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : {};
+    const title = typeof body.title === "string" ? body.title.trim() : "";
+    const category = typeof body.category === "string" ? body.category : "";
+    const description = typeof body.description === "string" ? body.description.trim() : "";
+    const estimatedDuration = typeof body.estimatedDuration === "string" ? body.estimatedDuration.trim() : "";
+    const serviceMode = typeof body.serviceMode === "string" ? body.serviceMode : "";
+    const serviceArea = typeof body.serviceArea === "string" ? body.serviceArea.trim() : "";
+    const basePrice = typeof body.basePrice === "number" ? body.basePrice : Number.NaN;
+
+    if (title.length < 3 || title.length > 100) return sendError(res, 400, "Service title must be between 3 and 100 characters.");
+    if (!allowedCategories.includes(category)) return sendError(res, 400, "Choose a valid service category.");
+    if (!description || description.length > 2000) return sendError(res, 400, "Service description is required and must be 2000 characters or fewer.");
+    if (!Number.isFinite(basePrice) || basePrice <= 0) return sendError(res, 400, "Base price must be greater than zero.");
+    if (!estimatedDuration || estimatedDuration.length > 80) return sendError(res, 400, "Estimated duration is required and must be 80 characters or fewer.");
+    if (!allowedModes.includes(serviceMode)) return sendError(res, 400, "Choose a valid service mode.");
+    if (serviceArea.length < 2 || serviceArea.length > 100) return sendError(res, 400, "Service area must be between 2 and 100 characters.");
+    if (!isImgBbImageUrl(body.image)) return sendError(res, 400, "Upload a valid service image before submitting.");
+
+    const service = {
+      title,
+      category,
+      description,
+      image: body.image,
+      basePrice,
+      estimatedDuration,
+      serviceMode,
+      serviceArea,
+      technicianName: req.authUser.name,
+      technicianEmail: req.authUser.email,
+      approvalStatus: "pending",
+      isAvailable: true,
+      createdAt: new Date(),
+    };
+    const result = await servicesCollection.insertOne(service);
+    return res.status(201).json({ id: result.insertedId.toString(), ...service, technicianEmail: undefined });
+  } catch {
+    return sendError(res, 500, "Unable to submit this service right now.");
+  }
+});
+
+app.patch("/api/services/:id", verifyToken, verifyTechnician, express.json(), async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) return sendError(res, 400, "Invalid service ID.");
+    if (!servicesCollection) return sendError(res, 500, "Unable to update this service right now.");
+
+    const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : {};
+    const ownership = { _id: new ObjectId(id), technicianEmail: req.authUser.email };
+
+    // Availability is a separate single-field update and never changes approval.
+    if (Object.keys(body).length === 1 && Object.prototype.hasOwnProperty.call(body, "isAvailable")) {
+      if (typeof body.isAvailable !== "boolean") return sendError(res, 400, "Availability must be true or false.");
+      const result = await servicesCollection.updateOne(ownership, { $set: { isAvailable: body.isAvailable } });
+      if (!result.matchedCount) return sendError(res, 404, "Service not found.");
+      return res.json({ message: "Service availability updated." });
+    }
+
+    const title = typeof body.title === "string" ? body.title.trim() : "";
+    const category = typeof body.category === "string" ? body.category : "";
+    const description = typeof body.description === "string" ? body.description.trim() : "";
+    const estimatedDuration = typeof body.estimatedDuration === "string" ? body.estimatedDuration.trim() : "";
+    const serviceMode = typeof body.serviceMode === "string" ? body.serviceMode : "";
+    const serviceArea = typeof body.serviceArea === "string" ? body.serviceArea.trim() : "";
+    const basePrice = typeof body.basePrice === "number" ? body.basePrice : Number.NaN;
+
+    if (title.length < 3 || title.length > 100) return sendError(res, 400, "Service title must be between 3 and 100 characters.");
+    if (!allowedCategories.includes(category)) return sendError(res, 400, "Choose a valid service category.");
+    if (!description || description.length > 2000) return sendError(res, 400, "Service description is required and must be 2000 characters or fewer.");
+    if (!Number.isFinite(basePrice) || basePrice <= 0) return sendError(res, 400, "Base price must be greater than zero.");
+    if (!estimatedDuration || estimatedDuration.length > 80) return sendError(res, 400, "Estimated duration is required and must be 80 characters or fewer.");
+    if (!allowedModes.includes(serviceMode)) return sendError(res, 400, "Choose a valid service mode.");
+    if (serviceArea.length < 2 || serviceArea.length > 100) return sendError(res, 400, "Service area must be between 2 and 100 characters.");
+    if (body.image !== undefined && !isImgBbImageUrl(body.image)) return sendError(res, 400, "Choose a valid ImgBB service image.");
+
+    const updates = {
+      title, category, description, basePrice, estimatedDuration,
+      serviceMode, serviceArea, approvalStatus: "pending", updatedAt: new Date(),
+    };
+    if (body.image !== undefined) updates.image = body.image;
+    const result = await servicesCollection.updateOne(ownership, { $set: updates });
+    if (!result.matchedCount) return sendError(res, 404, "Service not found.");
+    return res.json({ message: "Service updated and submitted for admin approval." });
+  } catch {
+    return sendError(res, 500, "Unable to update this service right now.");
+  }
+});
+
+app.delete("/api/services/:id", verifyToken, verifyTechnician, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) return sendError(res, 400, "Invalid service ID.");
+    if (!servicesCollection) return sendError(res, 500, "Unable to delete this service right now.");
+    const result = await servicesCollection.deleteOne({ _id: new ObjectId(id), technicianEmail: req.authUser.email });
+    if (!result.deletedCount) return sendError(res, 404, "Service not found.");
+    return res.json({ message: "Service deleted successfully." });
+  } catch {
+    return sendError(res, 500, "Unable to delete this service right now.");
+  }
+});
 
 app.patch("/api/users/profile", verifyToken, async (req, res) => {
   try {
@@ -354,6 +552,122 @@ app.get("/api/bookings/my/summary", verifyToken, verifyCustomer, async (req, res
     });
   } catch {
     return sendError(res, 500, "Unable to load booking summary right now.");
+  }
+});
+
+app.get("/api/bookings/technician", verifyToken, verifyTechnician, async (req, res) => {
+  if (!bookingMatch(req, res)) return;
+  try {
+    const statuses = ["requested", "accepted", "in-progress", "completed", "rejected", "cancelled"];
+    const filter = { technicianEmail: req.authUser.email };
+    const requestedStatus = typeof req.query.status === "string" ? req.query.status : "";
+    if (statuses.includes(requestedStatus)) filter.status = requestedStatus;
+
+    const search = typeof req.query.search === "string" ? req.query.search.trim().slice(0, 100) : "";
+    if (search) {
+      const pattern = new RegExp(escapeSearch(search), "i");
+      filter.$or = [
+        { serviceTitle: pattern },
+        { customerName: pattern },
+        { customerEmail: pattern },
+      ];
+    }
+
+    const sortKey = typeof req.query.sort === "string" ? req.query.sort : "newest";
+    const sort = {
+      oldest: { createdAt: 1, _id: 1 },
+      preferred_earliest: { preferredDate: 1, createdAt: -1, _id: -1 },
+      preferred_latest: { preferredDate: -1, createdAt: -1, _id: -1 },
+    }[sortKey] || { createdAt: -1, _id: -1 };
+
+    const [bookings, grouped] = await Promise.all([
+      bookingsCollection.find(filter)
+        .project({
+          _id: 1, serviceId: 1, serviceTitle: 1, serviceImage: 1, category: 1,
+          serviceMode: 1, serviceArea: 1, customerName: 1, customerEmail: 1,
+          customerPhone: 1, address: 1, preferredDate: 1, problemDescription: 1,
+          basePrice: 1, finalAmount: 1, status: 1, paymentStatus: 1, createdAt: 1,
+        })
+        .sort(sort)
+        .toArray(),
+      bookingsCollection.aggregate([
+        { $match: { technicianEmail: req.authUser.email } },
+        { $group: { _id: "$status", count: { $sum: 1 } } },
+      ]).toArray(),
+    ]);
+
+    const counts = Object.fromEntries(statuses.map((status) => [status, 0]));
+    for (const entry of grouped) if (Object.hasOwn(counts, entry._id)) counts[entry._id] = entry.count;
+    counts.all = grouped.reduce((sum, entry) => sum + entry.count, 0);
+
+    return res.json({
+      bookings: bookings.map((booking) => ({
+        ...booking,
+        _id: String(booking._id),
+        ...(booking.serviceId ? { serviceId: String(booking.serviceId) } : {}),
+      })),
+      counts,
+    });
+  } catch {
+    return sendError(res, 500, "Unable to load repair requests right now.");
+  }
+});
+
+app.patch("/api/bookings/:id/status", verifyToken, verifyTechnician, express.json(), async (req, res) => {
+  if (!bookingMatch(req, res)) return;
+  const { id } = req.params;
+  if (!ObjectId.isValid(id)) return sendError(res, 400, "Invalid booking ID.");
+
+  const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : {};
+  const nextStatus = body.status;
+  const allowedNextStatuses = {
+    requested: ["accepted", "rejected"],
+    accepted: ["in-progress"],
+    "in-progress": ["completed"],
+  };
+  if (typeof nextStatus !== "string" || !Object.values(allowedNextStatuses).flat().includes(nextStatus)) {
+    return sendError(res, 400, "Invalid booking status transition.");
+  }
+  if (nextStatus === "completed" && (typeof body.finalAmount !== "number" || !Number.isFinite(body.finalAmount) || body.finalAmount <= 0)) {
+    return sendError(res, 400, "Final amount must be greater than zero.");
+  }
+  if (nextStatus !== "completed" && Object.prototype.hasOwnProperty.call(body, "finalAmount")) {
+    return sendError(res, 400, "Final amount is only accepted when completing a job.");
+  }
+
+  try {
+    const currentStatuses = Object.entries(allowedNextStatuses)
+      .filter(([, targets]) => targets.includes(nextStatus))
+      .map(([current]) => current);
+    const update = { status: nextStatus, updatedAt: new Date() };
+    if (nextStatus === "completed") update.finalAmount = Math.round(body.finalAmount * 100) / 100;
+
+    const result = await bookingsCollection.updateOne(
+      { _id: new ObjectId(id), technicianEmail: req.authUser.email, status: { $in: currentStatuses } },
+      { $set: update },
+    );
+    if (!result.matchedCount) {
+      const booking = await bookingsCollection.findOne({ _id: new ObjectId(id), technicianEmail: req.authUser.email }, { projection: { status: 1 } });
+      if (!booking) return sendError(res, 404, "Booking not found.");
+      return sendError(res, 400, "This booking can no longer move to that status.");
+    }
+
+    const booking = await bookingsCollection.findOne(
+      { _id: new ObjectId(id), technicianEmail: req.authUser.email },
+      { projection: {
+        _id: 1, serviceId: 1, serviceTitle: 1, serviceImage: 1, category: 1,
+        serviceMode: 1, serviceArea: 1, customerName: 1, customerEmail: 1,
+        customerPhone: 1, address: 1, preferredDate: 1, problemDescription: 1,
+        basePrice: 1, finalAmount: 1, status: 1, paymentStatus: 1, createdAt: 1,
+      } },
+    );
+    return res.json({ booking: booking ? {
+      ...booking,
+      _id: String(booking._id),
+      ...(booking.serviceId ? { serviceId: String(booking.serviceId) } : {}),
+    } : null });
+  } catch {
+    return sendError(res, 500, "Unable to update this repair request right now.");
   }
 });
 
